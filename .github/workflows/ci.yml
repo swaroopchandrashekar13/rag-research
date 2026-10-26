@@ -1,0 +1,194 @@
+# CI: tests on Python 3.12 and 3.13, recomputation of the stored analyses, and the manuscript build.
+# The data job (manual, with_data) downloads the four public datasets and runs the data-dependent checks.
+# Dense retrieval and model generation need a GPU and are not run here.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      with_data:
+        description: "Also download the four public datasets (~110 MB) and run the data-dependent checks"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests and structural validation (py${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements/core.txt -r requirements/test.txt
+          .venv/bin/python -m pip install --no-deps -e .
+          mkdir -p ci-out
+      - name: Syntax and imports
+        run: |
+          .venv/bin/python -m compileall -q src tests tools manuscript experiments literature
+          .venv/bin/python -I -c "import ragmv.analyze, ragmv.analyze1b, ragmv.analyze_generation, ragmv.budgetfill, ragmv.charmetric, ragmv.chunking, ragmv.data, ragmv.dense, ragmv.evaluate, ragmv.evaluate_multi, ragmv.fetch, ragmv.figures, ragmv.generate, ragmv.integrity, ragmv.metrics_form, ragmv.posthoc, ragmv.provenance, ragmv.retrieval, ragmv.run, ragmv.run1b, ragmv.semantic, ragmv.stats"
+      - name: Tests (data-dependent and optional-SDK tests are reported as skipped)
+        run: .venv/bin/python -m pytest -q -rs --junitxml=ci-out/pytest.xml
+      - name: Stored results and bibliography
+        run: |
+          .venv/bin/python -I tools/validate_artifacts.py --report ci-out/validation.md
+          .venv/bin/python -I tools/check_bibliography.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-py${{ matrix.python }}
+          path: ci-out/
+
+  recompute:
+    name: recompute the stored analyses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements/core.txt
+          .venv/bin/python -m pip install --no-deps -e .
+          mkdir -p ci-out
+      - name: Recompute E1, E3 and E2 into new directories (planned computation and corrected inference)
+        run: |
+          W="$RUNNER_TEMP/recompute"
+          E1=experiments/E1_retrieval_multiverse/runs/confirmatory-20261018
+          E3=experiments/E3_semantic_dense/runs/confirmatory-kaggle-gpu
+          .venv/bin/python -I -m ragmv.analyze --run $E1 --label CONFIRMATORY --inference planned --out "$W/e1"
+          .venv/bin/python -I -m ragmv.analyze1b --run $E3 --label CONFIRMATORY --inference planned --out "$W/e3"
+          .venv/bin/python -I -m ragmv.analyze_generation --run experiments/E2_generation/runs/qwen3-4b-kaggle-gpu --out "$W/e2"
+          for u in query document; do
+            .venv/bin/python -I -m ragmv.analyze --run $E1 --label CONFIRMATORY --unit $u --out "$W/e1-$u"
+            .venv/bin/python -I -m ragmv.analyze1b --run $E3 --label CONFIRMATORY --unit $u --out "$W/e3-$u"
+          done
+      - name: Compare every field with the stored results; check the consumed inputs against experiments/SHA256SUMS
+        run: |
+          W="$RUNNER_TEMP/recompute"
+          S="--inputs-against experiments/SHA256SUMS"
+          A1=experiments/E1_retrieval_multiverse/analysis; R1=experiments/E1_retrieval_multiverse/runs/confirmatory-20261018
+          A3=experiments/E3_semantic_dense/analysis; R3=experiments/E3_semantic_dense/runs/confirmatory-kaggle-gpu
+          .venv/bin/python -I tools/compare_results.py $A1/confirmatory-20261018/results.json "$W/e1/results.json" $S --run-dir $R1 | tee ci-out/compare-e1.txt
+          .venv/bin/python -I tools/compare_results.py $A3/confirmatory-kaggle-gpu/results.json "$W/e3/results.json" $S --run-dir $R3 | tee ci-out/compare-e3.txt
+          .venv/bin/python -I tools/compare_results.py experiments/E2_generation/analysis/qwen3-4b-kaggle-gpu/results.json "$W/e2/results.json" $S --run-dir experiments/E2_generation/runs/qwen3-4b-kaggle-gpu | tee ci-out/compare-e2.txt
+          for u in query document; do
+            .venv/bin/python -I tools/compare_results.py $A1/confirmatory-20261018-consistent-$u/results.json "$W/e1-$u/results.json" $S --run-dir $R1 | tee ci-out/compare-e1-$u.txt
+            .venv/bin/python -I tools/compare_results.py $A3/confirmatory-kaggle-gpu-consistent-$u/results.json "$W/e3-$u/results.json" $S --run-dir $R3 | tee ci-out/compare-e3-$u.txt
+          done
+        shell: bash -o pipefail {0}
+      - name: The stored pilot analysis is reproduced by the settings it was computed with
+        run: .venv/bin/python -I tools/pilot_reconcile.py --out-json ci-out/pilot.json --out-md ci-out/pilot.md
+      - name: Tier 2 post-hoc sensitivity reproduces the stored record
+        run: |
+          .venv/bin/python -I tools/generation_sensitivity.py --out-json ci-out/e2-sensitivity.json
+          .venv/bin/python -I -c "import json,sys; sys.exit(json.load(open('ci-out/e2-sensitivity.json')) != json.load(open('experiments/E2_generation/analysis/posthoc-sensitivity/results.json')))"
+      - name: Independent re-implementation of the statistics (does not import the package)
+        run: |
+          .venv/bin/python -I tools/independent_stats.py --out-json ci-out/statistical_checks.json --out-md ci-out/statistical_checks.md
+          .venv/bin/python -I -c "import json,sys; a=json.load(open('ci-out/statistical_checks.json')); b=json.load(open('experiments/statistical_checks/results.json')); sys.exit(a != b)"
+      - name: Every number in the manuscript recomputed from its source
+        run: .venv/bin/python -I tools/trace_claims.py --out ci-out/claim-macros.md
+      - name: Budget-underfill census and bound reproduce the stored records
+        run: |
+          .venv/bin/python -I tools/budget_underfill_census.py --out-json ci-out/census.json --out-md ci-out/census.md
+          .venv/bin/python -I -c "import json,sys; sys.exit(json.load(open('ci-out/census.json')) != json.load(open('experiments/budget_underfill/census.json')))"
+          .venv/bin/python -I tools/underfill_bound.py --census ci-out/census.json --work "$RUNNER_TEMP/bound" --out-json ci-out/bound.json
+          .venv/bin/python -I -c "import json,sys; sys.exit(json.load(open('ci-out/bound.json')) != json.load(open('experiments/budget_underfill/bound.json')))"
+          .venv/bin/python -I tools/underfill_bound.py --census ci-out/census.json --work "$RUNNER_TEMP/bound-c" --out-json ci-out/bound-consistent.json --inference consistent
+          .venv/bin/python -I -c "import json,sys; sys.exit(json.load(open('ci-out/bound-consistent.json')) != json.load(open('experiments/budget_underfill/bound-consistent.json')))"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recompute
+          path: ci-out/
+
+  manuscript:
+    name: regenerate displays and build the manuscript
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install TeX Live and the package
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended lmodern latexmk poppler-utils
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements/core.txt
+          .venv/bin/python -m pip install --no-deps -e .
+          mkdir -p ci-out
+      - name: Regenerate the displays and compare them with the stored ones
+        run: .venv/bin/python -I manuscript/build_displays.py --out "$RUNNER_TEMP/displays" --compare manuscript | tee ci-out/displays.txt
+        shell: bash -o pipefail {0}
+      - name: Build the named and anonymous versions
+        run: .venv/bin/python -I manuscript/build_pdf.py --workdir "$RUNNER_TEMP/build" --report ci-out/build.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manuscript
+          path: ci-out/
+
+  data:
+    name: checks with the public datasets (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.with_data
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements/core.txt -r requirements/test.txt
+          .venv/bin/python -m pip install --no-deps -e .
+          mkdir -p ci-out
+      - name: Download the datasets and verify their checksums
+        run: |
+          .venv/bin/python -I -m ragmv.fetch
+          .venv/bin/python -I -m ragmv.fetch --verify-only
+      - name: Data-dependent tests (include the BM25 reproduction of the stored runs)
+        run: RAGMV_DATA_ROOT=data/raw .venv/bin/python -m pytest -q -rs --junitxml=ci-out/pytest-data.xml
+      - name: Splits, query lists, gold spans, chunk partitions and Tier 2 inputs rebuilt from the data
+        run: .venv/bin/python -I tools/validate_artifacts.py --data-root data/raw --report ci-out/validation-data.md
+      - name: Gold-span containment reproduces the stored record
+        run: |
+          .venv/bin/python -I tools/gold_containment.py --data-root data/raw --run experiments/E1_retrieval_multiverse/runs/confirmatory-20261018 --out-json ci-out/containment.json
+          .venv/bin/python -I -c "import json,sys; sys.exit(json.load(open('ci-out/containment.json')) != json.load(open('experiments/E1_retrieval_multiverse/analysis/posthoc-gold-containment/results.json')))"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: data
+          path: ci-out/

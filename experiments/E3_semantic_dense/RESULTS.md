@@ -1,0 +1,71 @@
+# Study 1b (E3) confirmatory results — semantic chunking and dense retrieval
+
+*2026-10-19 · analysis plan `research/analysis_plan_study1b.md` v1.0 · run `runs/confirmatory-kaggle-gpu`
+(Kaggle Tesla T4; bge-m3 at the code's pinned revision `5617a9f6`, fp16) · analysis `analysis/confirmatory-kaggle-gpu` · 9,253
+confirmatory queries (SQuAD 2.0 4,744 · COVID-QA 1,771 · CUAD 996 · Qasper 1,742), never seen by the pilot.*
+
+> The run predates the manifest schema that records code and input digests. Its BM25 arm was re-executed from the
+> public data on 2026-10-24 and reproduced exactly; the dense arm needs a GPU and was not re-executed.
+
+## Integrity checks (before reading results)
+- All manifests `ok`; query lists equal the confirmatory split (the same 9,253 queries as Study 1).
+- Fixed-chunk BM25 scores equal Study 1's stored confirmatory scores exactly (all datasets, W = 128/256/512).
+- Semantic chunks partition every document, never exceed 512 words, and are **identical to the pilot's chunks**
+  (embeddings reproduced exactly across two GPU sessions); BM25 scores recompute exactly from the stored chunks.
+- The planned analysis rerun locally reproduces the Kaggle `results.json` exactly.
+
+## Planned hypotheses
+| ID | Statement (short) | Estimate | 95% CI | Threshold | Verdict |
+|---|---|---:|---|---:|---|
+| **H4** (primary) | Share of universes favouring the **shorter arm** (semantic breakpoint vs fixed-W) rises from count- to budget-matched | **55.4 pp** (9.4% → 64.8%) | [50.8, 63.1] | 20 pp | **Supported** |
+| H4b | Same for clustering chunks | 64.4 pp (6.9% → 71.3%) | [56.5, 68.3] | 10 pp | Supported |
+| H5 | With dense retrieval, share favouring fixed-512 drops (Study 1's H1) | 19.4 pp (25.0% → 5.6%) | [16.7, 41.7] | 20 pp | **Inconclusive** (estimate just below the threshold) |
+| H5b *(post-pilot amendment)* | With dense retrieval, share favouring fixed-128 (shorter arm) rises | 58.3 pp (33.3% → 91.7%) | [45.1, 64.6] | 20 pp | Supported |
+
+H4 sensitivity analyses (all planned): BH-FDR 54.3 pp · without SQuAD 48.0 pp [42.7, 58.3] · document-cluster
+bootstrap 58.7 pp [50.0, 63.3] · all budgets 53.7 pp [49.7, 60.9] · BM25 only 61.1 pp [57.2, 72.5] · dense only
+49.8 pp [39.1, 58.1]. The conclusion holds under every one, and with both retrievers.
+
+## Corrected inference (reported results)
+
+As in Study 1 (`experiments/E1_retrieval_multiverse/RESULTS.md`), the reported analyses use one Wald verdict rule
+for the point estimate and every joint-bootstrap replicate, at the query or the document unit (`--inference
+consistent`); the planned computation above is kept and still reproduces exactly. This correction was made after
+the results were known.
+
+| ID | Query unit | Verdict | Document unit | Verdict |
+|---|---|---|---|---|
+| H4 | 55.6 pp [50.8, 63.1] | supported | 59.0 pp [51.3, 65.0] | supported |
+| H4b | 65.3 pp [56.5, 68.3] | supported | 65.2 pp [55.4, 67.1] | supported |
+| H5 | 21.5 pp [16.7, 41.7] | supported | 19.4 pp [16.7, 39.6] | inconclusive |
+| H5b | 58.3 pp [45.1, 64.6] | supported | 58.3 pp [47.9, 75.0] | supported |
+
+H5 is at the threshold: under the corrected rule at the query unit one more count-matched universe (of 48) supports
+fixed-512 than under the planned percentile verdicts (a SQuAD universe whose percentile interval ends exactly at zero),
+which lifts the estimate from 19.4 to 21.5 pp; at the document unit it stays at 19.4 pp. H5 is therefore unresolved.
+The corrected verdicts carry no Monte-Carlo error, so the seed sensitivity noted below no longer applies to them.
+H4 sensitivity (query unit): BH-FDR 54.3 pp · without SQuAD 48.1 pp [42.7, 58.3] · document resampling
+59.0 pp [51.3, 65.0] · all budgets 53.6 pp [49.7, 60.9] · BM25 only 61.1 pp [57.2, 72.5] · dense only
+50.0 pp [39.1, 58.1]. Outputs: `analysis/confirmatory-kaggle-gpu-consistent-query/` and `-consistent-document/`.
+
+## What it means (plain language)
+- **The verdict on "semantic chunking beats fixed-size chunking" depends on the protocol in the same way as Study 1's
+  chunk-size verdicts.** Against 128-word fixed chunks, breakpoint chunking wins 60% of universes at equal top-k and 8% at equal
+  text (fixed wins 75%); clustering chunks win 53% vs 0% (fixed 97%). Against 512-word chunks the direction flips,
+  because there the semantic chunks are the shorter arm. The pattern is consistent with **which arm returns more text**
+  driving the verdict; the design does not separate text volume from every other property of the chunks, so this is
+  an interpretation, not an identified mechanism.
+- **The effect holds with a dense retriever** (H4 dense-only 49.8 pp; H5b 58.3 pp). With bge-m3 large chunks are
+  weaker even at equal k, so H5's fixed-512 share has little room to fall — the pilot predicted this floor, and H5 is
+  inconclusive, not falsified. Reported as planned. *Post-hoc check: the H5 verdict is
+  sensitive to Monte-Carlo error — with nine other verdict-bootstrap seeds the estimate is 21.5–24.3 pp, which would
+  meet the support rule (only 48 and 36 dense P1 universes; `experiments/statistical_checks/results.json`). The
+  planned seed 7 gives 19.4 pp; H5 is best read as unresolved.*
+
+## Limits
+One embedding model; the clustering defaults (λ = 0.5, threshold 0.5) let clusters fill the 512-word cap with
+bge-m3 (disclosed before the run); four English extractive-QA datasets; retrieval metrics, not answers (Tier 2 did not detect a
+carry-over to answer F1 for a 4B reader; that interaction is inconclusive, not shown to be absent); shares describe
+this designed multiverse. Metrics are computed on words, not characters as the plan states (see
+`research/ERRATA_analysis_plans.md`; post-hoc BM25 check in `analysis/posthoc-charmetric-bm25-20261024/`).
+

@@ -1,0 +1,800 @@
+"""Independent statistical verification of the stored Study 1, Study 1b and Tier 2 results.
+
+This file deliberately does not import `ragmv.stats` or `ragmv.analyze`: it re-implements, from the analysis plans
+text, the verdict rule, the paired percentile bootstrap (same documented RNG design so results can match exactly),
+share arithmetic, the joint query bootstrap for share CIs, eta^2 (cross-checked with statsmodels OLS type II), the H3
+sample-size rule and the hypothesis rules, reading the NPZ arrays directly. It also re-implements the consistent
+procedure (one Wald verdict rule for point estimates and replicates, at the query or the document unit) and checks
+the corrected analyses against it. It then runs labelled POST-HOC
+sensitivity checks that are *not* in the analysis plans: Monte-Carlo seed robustness, the Benjamini-Hochberg family,
+universe weighting, a document-cluster design effect for H3, verdict margins relative to float16 rounding,
+and the P1 protocol contrast separately for each span metric.
+
+Usage: python -I tools/independent_stats.py --out-json FILE --out-md FILE [--posthoc-word64 DIR]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+E1 = ROOT / "experiments/E1_retrieval_multiverse"
+E3 = ROOT / "experiments/E3_semantic_dense"
+E2 = ROOT / "experiments/E2_generation"
+DATASETS = ("squad2", "covidqa", "cuad", "qasper")
+Z975, Z80 = 1.959963984540054, 0.8416212335729143
+
+
+# ------------------------------------------------------------------------------------------------ primitives
+def load_run(path: Path):
+    out = {}
+    for d in DATASETS:
+        m = json.loads((path / d / "manifest.json").read_text())
+        q = json.loads((path / d / "queries.json").read_text())
+        out[d] = {"cfg": m["config"], "manifest": m, "doc": np.asarray(q["doc_idx"]), "npz": path / d}
+    return out
+
+
+def scores(run, d, chunking):
+    with np.load(run[d]["npz"] / f"{chunking}.npz", allow_pickle=False) as z:
+        return z["scores"].astype(np.float32)
+
+
+def op_cols(cfg, protocol, wmax, admissible=True):
+    cols = []
+    for i, lab in enumerate(cfg["ops"]):
+        kind, val = lab[0], int(lab[1:])
+        if protocol == "count" and kind == "k":
+            cols.append(i)
+        if protocol == "budget" and kind == "B" and (val >= wmax or not admissible):
+            cols.append(i)
+    return cols
+
+
+def diffs(run, d, a, b, protocol, wmax, retrievers=None, admissible=True):
+    cfg = run[d]["cfg"]
+    r = [i for i, name in enumerate(cfg["retrievers"]) if retrievers is None or name in retrievers]
+    delta = (scores(run, d, a) - scores(run, d, b))[r][:, :, op_cols(cfg, protocol, wmax, admissible), :]
+    n = delta.shape[1]
+    return np.transpose(delta, (1, 0, 2, 3)).reshape(n, -1)  # [queries, universes]
+
+
+def weights(n, reps, seed, clusters=None):
+    rng = np.random.default_rng(seed)
+    if clusters is None:
+        return rng.multinomial(n, np.full(n, 1.0 / n), size=reps).astype(np.float32)
+    ids, inv = np.unique(clusters, return_inverse=True)
+    return rng.multinomial(len(ids), np.full(len(ids), 1.0 / len(ids)), size=reps).astype(np.float32)[:, inv]
+
+
+def percentile_verdicts(x, reps=2000, seed=7, clusters=None):
+    x = np.asarray(x, dtype=np.float32)
+    w = weights(x.shape[0], reps, seed, clusters)
+    boot = (w @ x) / w.sum(axis=1, keepdims=True)
+    lo, hi = np.quantile(boot, [0.025, 0.975], axis=0)
+    v = np.zeros(x.shape[1], dtype=np.int8)
+    v[lo > 0], v[hi < 0] = 1, -1
+    p = np.minimum(1.0, 2 * np.minimum((boot <= 0).mean(axis=0), (boot >= 0).mean(axis=0)))
+    return v, lo, hi, x.mean(axis=0), p
+
+
+def shares(vs):
+    v = np.concatenate(vs)
+    return {"A": float((v == 1).mean()), "B": float((v == -1).mean()), "n": int(v.size)}
+
+
+def bh(p, q=0.05):
+    order = np.argsort(p)
+    ok = p[order] <= q * np.arange(1, len(p) + 1) / len(p)
+    k = ok.nonzero()[0].max() + 1 if ok.any() else 0
+    out = np.zeros(len(p), bool)
+    out[order[:k]] = True
+    return out
+
+
+def joint_share_ci(blocks, side_stat, reps=1000, seed=11, clusters=None):
+    """Joint bootstrap: per replicate, one multinomial query (or, with `clusters`, document) resample per dataset (in
+    dataset order), shared by all universes of that dataset; normal-approximation verdicts inside each replicate."""
+    rng = np.random.default_rng(seed)
+    inv = {d: np.unique(c, return_inverse=True)[1] for d, c in clusters.items()} if clusters else {}
+    out = np.empty(reps)
+    for r in range(reps):
+        verdicts = {}
+        for d, x in blocks.items():
+            n = x.shape[0]
+            if d in inv:
+                k = int(inv[d].max()) + 1
+                w = rng.multinomial(k, np.full(k, 1.0 / k)).astype(np.float64)[inv[d]]
+            else:
+                w = rng.multinomial(n, np.full(n, 1.0 / n)).astype(np.float64)
+            ne = w.sum()
+            m = w @ x / ne
+            sd = np.sqrt(np.maximum(w @ (x * x) / ne - m * m, 0.0) * ne / max(ne - 1, 1))
+            half = Z975 * sd / np.sqrt(ne)
+            verdicts[d] = np.where(m - half > 0, 1, np.where(m + half < 0, -1, 0))
+        out[r] = side_stat(verdicts)
+    lo, hi = np.quantile(out, [0.025, 0.975])
+    return float(lo), float(hi)
+
+
+def rule(est, lo, hi, thr):
+    return "supported" if est >= thr and lo > 0 else ("falsified" if hi < thr else "inconclusive")
+
+
+def close(a, b, tol=1e-12):
+    return abs(float(a) - float(b)) <= tol
+
+
+# ------------------------------------------------------------------------------------------------ Study 1
+CLAIMS1 = [("P1", "fixed-128", "fixed-512", 512)] + [(f"S1-{w}", f"fixed-{w}", f"fixed-{2 * w}", 2 * w) for w in (64, 128, 256)] \
+    + [(f"S2-{w}", f"fixed-{w}-o25", f"fixed-{w}", w) for w in (64, 128, 256, 512)] \
+    + [(f"S3-{w}", f"paragraph-{w}", f"fixed-{w}", w) for w in (64, 128, 256, 512)] \
+    + [(f"S4-{w}", f"sentence-{w}", f"fixed-{w}", w) for w in (64, 128, 256, 512)]
+
+
+def study1(run_dir: Path, results: dict, checks: list, post: dict) -> None:
+    run = load_run(run_dir)
+    by = {c[0]: c for c in CLAIMS1}
+    # verdict shares, every claim x protocol x dataset
+    n_bad = n_tot = 0
+    vcache = {}
+    for cid, a, b, wmax in CLAIMS1:
+        for prot in ("count", "budget"):
+            vs = []
+            for d in DATASETS:
+                v, lo, hi, mean, p = percentile_verdicts(diffs(run, d, a, b, prot, wmax))
+                vcache[(cid, prot, d)] = (v, lo, hi, mean, p)
+                vs.append(v)
+                st = results["verdict_shares"][cid][prot]["by_dataset"][d]
+                n_tot += 3
+                n_bad += (not close(st["support_A"], (v == 1).mean())) + (not close(st["support_B"], (v == -1).mean())) \
+                    + (not close(st["mean_delta"], mean.mean(), 1e-6))
+            s = shares(vs)
+            st = results["verdict_shares"][cid][prot]
+            n_tot += 3
+            n_bad += (not close(st["support_A"], s["A"])) + (not close(st["support_B"], s["B"])) + (st["n_universes"] != s["n"])
+    checks.append(("Study 1 verdict shares (21 claims x 2 protocols x 4 datasets + pooled)", n_bad == 0,
+                   f"{n_tot} quantities compared, {n_bad} mismatches"))
+    # H1 / H1b point estimates and CIs (joint bootstrap, independent implementation)
+    for h, cid, side, thr, sign in (("H1", "P1", -1, 0.20, 1), ("H1b", "S3-256", 1, 0.10, -1)):
+        _, a, b, wmax = by[cid]
+        blocks = {d: np.hstack([diffs(run, d, a, b, "count", wmax), diffs(run, d, a, b, "budget", wmax)]) for d in DATASETS}
+        split = {d: diffs(run, d, a, b, "count", wmax).shape[1] for d in DATASETS}
+
+        def stat(v, side=side, split=split):
+            vc = np.concatenate([v[d][: split[d]] for d in DATASETS])
+            vb = np.concatenate([v[d][split[d]:] for d in DATASETS])
+            return float((vc == side).mean() - (vb == side).mean())
+
+        key = "A" if side == 1 else "B"
+        est = shares([vcache[(cid, "count", d)][0] for d in DATASETS])[key] - \
+            shares([vcache[(cid, "budget", d)][0] for d in DATASETS])[key]
+        lo, hi = joint_share_ci(blocks, stat)
+        est, lo, hi = sign * est, *(sorted([sign * lo, sign * hi]))
+        r = results[h]
+        ok = close(r["estimate"], est) and close(r["ci95"][0], lo) and close(r["ci95"][1], hi) and r["verdict"] == rule(est, lo, hi, thr)
+        checks.append((f"Study 1 {h}: estimate, joint-bootstrap CI and verdict rule", ok,
+                       f"independent {100 * est:.1f} pp [{100 * lo:.1f}, {100 * hi:.1f}] -> {rule(est, lo, hi, thr)}; stored "
+                       f"{100 * r['estimate']:.1f} [{100 * r['ci95'][0]:.1f}, {100 * r['ci95'][1]:.1f}] {r['verdict']}"))
+    # H2 eta^2 by OLS (statsmodels, type II) on the universe means
+    import pandas as pd
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+
+    _, a, b, wmax = by["S3-256"]
+    rows = []
+    for d in DATASETS:
+        cfg = run[d]["cfg"]
+        mean = diffs(run, d, a, b, "budget", wmax).mean(axis=0)
+        labs = [(r_, cfg["ops"][o], m) for r_ in cfg["retrievers"] for o in op_cols(cfg, "budget", wmax) for m in cfg["metrics"]]
+        rows += [{"y": float(y), "dataset": d, "retriever": r_, "budget": o, "metric": m} for y, (r_, o, m) in zip(mean, labs)]
+    df = pd.DataFrame(rows)
+    tab = sm.stats.anova_lm(smf.ols("y ~ C(dataset) + C(retriever) + C(budget) + C(metric)", df).fit(), typ=2)
+    total = float(((df.y - df.y.mean()) ** 2).sum())
+    eta = {f: float(tab.loc[f"C({f})", "sum_sq"] / total) for f in ("dataset", "retriever", "budget", "metric")}
+    ok = all(close(eta[f], results["H2"]["eta2"][f], 1e-6) for f in eta)
+    checks.append(("Study 1 H2 eta^2 (statsmodels OLS type II on universe means)", ok,
+                   ", ".join(f"{f} {eta[f]:.4f} (stored {results['H2']['eta2'][f]:.4f})" for f in eta)
+                   + f"; dataset largest in {100 * results['H2']['dataset_largest_fraction']:.1f}% of stored replicates"))
+    # H3 required n
+    req, req_cluster = [], []
+    for cid in [c for c in by if c.startswith(("S2", "S3"))]:
+        _, a, b, wmax = by[cid]
+        for d in DATASETS:
+            x = diffs(run, d, a, b, "budget", wmax).astype(np.float64)
+            sd = x.std(axis=0, ddof=1)
+            req.append(np.ceil(((Z975 + Z80) * sd / 0.02) ** 2))
+            # post-hoc: document-cluster design effect (variance of the mean with documents as clusters)
+            doc = run[d]["doc"]
+            dev = x - x.mean(axis=0)
+            _, inv = np.unique(doc, return_inverse=True)
+            csum = np.zeros((inv.max() + 1, x.shape[1]))
+            np.add.at(csum, inv, dev)
+            var_mean = (csum ** 2).sum(axis=0) / x.shape[0] ** 2
+            sd_eff = np.sqrt(var_mean * x.shape[0])
+            req_cluster.append(np.ceil(((Z975 + Z80) * sd_eff / 0.02) ** 2))
+    r = np.concatenate(req)
+    rc = np.concatenate(req_cluster)
+    h3 = results["H3"]
+    ok = close(h3["share_universes_requiring_over_500"], (r > 500).mean()) and close(h3["median_required_n"], np.median(r))
+    checks.append(("Study 1 H3 required n (formula, ddof=1) and verdict rule", ok and h3["verdict"] == ("supported" if (r > 500).mean() > 0.5 else "falsified"),
+                   f"{100 * (r > 500).mean():.1f}% > 500, median {np.median(r):.0f} ({len(r)} universes)"))
+    post["H3_document_cluster_design_effect"] = {
+        "label": "POST-HOC: required n with the per-query SD replaced by sqrt(n * Var_cluster(mean)), documents as clusters",
+        "share_over_500": float((rc > 500).mean()), "median_required_n": float(np.median(rc)),
+        "median_design_effect": float(np.median(rc / np.maximum(r, 1)))}
+    # BH family (post-hoc): the implementation applies BH per (claim, protocol, dataset); alternative: per (claim, protocol)
+    for family in ("per_dataset", "pooled_over_datasets"):
+        sh = {}
+        for prot in ("count", "budget"):
+            vs, ps, ms = [], [], []
+            for d in DATASETS:
+                v, lo, hi, mean, p = vcache[("P1", prot, d)]
+                if family == "per_dataset":
+                    vs.append(np.where(bh(p), np.sign(mean), 0))
+                else:
+                    ps.append(p), ms.append(mean)
+            if family != "per_dataset":
+                p, mean = np.concatenate(ps), np.concatenate(ms)
+                vs = [np.where(bh(p), np.sign(mean), 0)]
+            sh[prot] = shares(vs)["B"]
+        post.setdefault("BH_family_P1", {})[family] = sh["count"] - sh["budget"]
+    stored_bh = results["H1_sensitivity"]["a_bh_fdr"]["estimate"]
+    checks.append(("Study 1 sensitivity (a) BH as implemented (family = claim x protocol x dataset)",
+                   close(stored_bh, post["BH_family_P1"]["per_dataset"]),
+                   f"independent {100 * post['BH_family_P1']['per_dataset']:.1f} pp, stored {100 * stored_bh:.1f} pp"))
+    # universe weighting (post-hoc): query-count weighting instead of equal weight per universe
+    nq = {d: len(run[d]["doc"]) for d in DATASETS}
+    wsum = sum(nq.values())
+    sb = {prot: sum(nq[d] / wsum * (vcache[("P1", prot, d)][0] == -1).mean() for d in DATASETS) for prot in ("count", "budget")}
+    post["universe_weighting_H1"] = {"equal_weight_per_universe": results["H1"]["estimate"],
+                                     "query_count_weighted_datasets": sb["count"] - sb["budget"],
+                                     "universes_per_dataset": {d: int(vcache[("P1", "count", d)][0].size) for d in DATASETS}}
+    # Monte-Carlo seed robustness (post-hoc)
+    seeds = (1, 2, 3, 4, 5)
+    h1s, flips = [], 0
+    for s in seeds:
+        sc = shares([percentile_verdicts(diffs(run, d, "fixed-128", "fixed-512", "count", 512), seed=s)[0] for d in DATASETS])["B"]
+        sbud = shares([percentile_verdicts(diffs(run, d, "fixed-128", "fixed-512", "budget", 512), seed=s)[0] for d in DATASETS])["B"]
+        h1s.append(sc - sbud)
+    for cid, a, b, wmax in CLAIMS1:
+        for prot in ("count", "budget"):
+            for d in DATASETS:
+                v7 = vcache[(cid, prot, d)][0]
+                v1 = percentile_verdicts(diffs(run, d, a, b, prot, wmax), seed=1)[0]
+                flips += int((v7 != v1).sum())
+    total_u = sum(vcache[k][0].size for k in vcache)
+    post["seed_robustness"] = {"H1_estimate_seeds_1_to_5": h1s, "H1_estimate_seed_7": results["H1"]["estimate"],
+                               "universe_verdicts_changed_seed7_vs_seed1": flips, "universe_verdicts_total": int(total_u)}
+    # float16 margin (post-hoc): CI bounds closer to 0 than the float16 rounding bound of a mean difference
+    eps = 2.0 ** -11  # max |rounding error| of a difference of two float16 values in [0, 1] is <= 2 * 2^-12
+    near = sum(int(((np.abs(vcache[k][1]) < eps) | (np.abs(vcache[k][2]) < eps)).sum()) for k in vcache)
+    post["float16_margin"] = {"universes_with_a_CI_bound_within_2^-11_of_zero": near, "universes_total": int(total_u)}
+
+
+def share_contrast(run, a, b, wmax, side, datasets=DATASETS, retrievers=None, admissible=True, clusters=None):
+    """share(side | count) - share(side | budget) and its joint-bootstrap interval (seed 11)."""
+    cl = (lambda d: clusters[d]) if clusters else (lambda d: None)
+    dc = {d: diffs(run, d, a, b, "count", wmax, retrievers) for d in datasets}
+    db = {d: diffs(run, d, a, b, "budget", wmax, retrievers, admissible) for d in datasets}
+    vc = [percentile_verdicts(dc[d], clusters=cl(d))[0] for d in datasets]
+    vb = [percentile_verdicts(db[d], clusters=cl(d))[0] for d in datasets]
+    est = float((np.concatenate(vc) == side).mean() - (np.concatenate(vb) == side).mean())
+    split = {d: dc[d].shape[1] for d in datasets}
+
+    def stat(v):
+        return float((np.concatenate([v[d][: split[d]] for d in datasets]) == side).mean()
+                     - (np.concatenate([v[d][split[d]:] for d in datasets]) == side).mean())
+    lo, hi = joint_share_ci({d: np.hstack([dc[d], db[d]]) for d in datasets}, stat,
+                            clusters={d: clusters[d] for d in datasets} if clusters else None)
+    return est, lo, hi
+
+
+def eta_ss(y, factors):
+    """Main-effect eta^2 by sums of squares (each factor's level means against the grand mean)."""
+    grand = y.mean()
+    total = float(((y - grand) ** 2).sum())
+    out = {}
+    for name, lv in factors.items():
+        out[name] = sum((lv == v).sum() * (y[lv == v].mean() - grand) ** 2 for v in np.unique(lv)) / total if total else 0.0
+    return out
+
+
+def study1_extras(run_dir: Path, results: dict, checks: list) -> None:
+    """H1 sensitivity intervals (b)-(e) and the H2 bootstrap fraction, recomputed independently."""
+    run = load_run(run_dir)
+    clusters = {d: run[d]["doc"] for d in DATASETS}
+    sens = results["H1_sensitivity"]
+    bad, lines = 0, []
+    for key, kw in (("b_without_squad2", {"datasets": [d for d in DATASETS if d != "squad2"]}),
+                    ("c_default_retriever", {"retrievers": ["lucene-k1.5-b0.75-stem"]}),
+                    ("d_cluster_bootstrap", {"clusters": clusters}),
+                    ("e_all_budgets", {"admissible": False})):
+        est, lo, hi = share_contrast(run, "fixed-128", "fixed-512", 512, -1, **kw)
+        s = sens[key]
+        ok = close(s["estimate"], est) and close(s["ci95"][0], lo) and close(s["ci95"][1], hi)
+        bad += not ok
+        lines.append(f"{key} {100 * est:.1f} [{100 * lo:.1f}, {100 * hi:.1f}]")
+    checks.append(("Study 1 H1 sensitivity analyses (b)-(e): estimates and joint-bootstrap CIs", bad == 0, "; ".join(lines)))
+    a, b, wmax = "paragraph-256", "fixed-256", 256
+    blocks, factors = {}, {k: [] for k in ("dataset", "retriever", "budget", "metric")}
+    for d in DATASETS:
+        cfg = run[d]["cfg"]
+        blocks[d] = diffs(run, d, a, b, "budget", wmax).astype(np.float64)
+        for r_ in cfg["retrievers"]:
+            for o in op_cols(cfg, "budget", wmax):
+                for m in cfg["metrics"]:
+                    for k, v in (("dataset", d), ("retriever", r_), ("budget", cfg["ops"][o]), ("metric", m)):
+                        factors[k].append(v)
+    factors = {k: np.array(v) for k, v in factors.items()}
+    rng = np.random.default_rng(13)
+    wins = 0
+    for _ in range(1000):
+        means = []
+        for d, x in blocks.items():
+            n = x.shape[0]
+            w = rng.multinomial(n, np.full(n, 1.0 / n)).astype(np.float64)
+            means.append(w @ x / w.sum())
+        eta = eta_ss(np.concatenate(means), factors)
+        wins += max(eta.items(), key=lambda kv: kv[1])[0] == "dataset"
+    frac = wins / 1000
+    h2 = results["H2"]
+    rule2 = "supported" if frac >= 0.95 else ("falsified" if frac <= 0.5 else "inconclusive")
+    checks.append(("Study 1 H2: bootstrap fraction (seed 13) and verdict rule", close(h2["dataset_largest_fraction"], frac)
+                   and h2["verdict"] == rule2, f"independent {100 * frac:.1f}% -> {rule2}; stored "
+                   f"{100 * h2['dataset_largest_fraction']:.1f}% {h2['verdict']}"))
+
+
+# ------------------------------------------------------------------------------------------------ Study 1b
+def study1b_seed_sensitivity(run_dir: Path, post: dict, seeds=(1, 2, 3, 4, 5, 6, 8, 9, 10)) -> None:
+    """POST-HOC: H5/H5b point estimates under other verdict-bootstrap seeds (the plan fixes seed 7)."""
+    run = load_run(run_dir)
+    out = {}
+    for seed in (7,) + tuple(seeds):
+        v = {p: [percentile_verdicts(diffs(run, d, "fixed-128", "fixed-512", p, 512, ["dense"]), seed=seed)[0]
+                 for d in DATASETS] for p in ("count", "budget")}
+        c, b = shares(v["count"]), shares(v["budget"])
+        out[seed] = {"H5": c["B"] - b["B"], "H5b": b["A"] - c["A"], "universes_count": c["n"], "universes_budget": b["n"]}
+    post["H5_seed_sensitivity"] = {"label": "POST-HOC: per-universe verdict bootstrap seed varied; seed 7 is the planned seed",
+                                   "by_seed": out}
+
+
+def study1b(run_dir: Path, results: dict, checks: list) -> None:
+    run = load_run(run_dir)
+    lengths = {d: {s["chunking"]: s["chunk_words_mean"] for s in run[d]["manifest"]["chunk_stats"]} for d in DATASETS}
+    bad = 0
+    for cid, arms in results["shorter_arm"].items():
+        a = "semantic-bp" if cid.startswith("S5") else "semantic-cl"
+        b = "fixed-" + cid.split("-")[1]
+        for d in DATASETS:
+            bad += arms[d] != (a if lengths[d][a] <= lengths[d][b] else b)
+    checks.append(("Study 1b shorter-arm orientation from manifest chunk statistics", bad == 0, f"{bad} mismatches"))
+    n_bad = n_tot = 0
+    vc = {}
+    for cid, sw in results["semantic_wins"].items():
+        a = "semantic-bp" if cid.startswith("S5") else "semantic-cl"
+        b = "fixed-" + cid.split("-")[1]
+        for prot in ("count", "budget"):
+            vs = [percentile_verdicts(diffs(run, d, a, b, prot, 512))[0] for d in DATASETS]
+            vc[(cid, prot)] = vs
+            s = shares(vs)
+            n_tot += 2
+            n_bad += (not close(sw[prot]["support_A"], s["A"])) + (not close(sw[prot]["support_B"], s["B"]))
+    checks.append(("Study 1b semantic-arm shares (6 claims x 2 protocols)", n_bad == 0, f"{n_tot} compared, {n_bad} mismatches"))
+    for h, fam, thr in (("H4", "S5", 0.20), ("H4b", "S6", 0.10)):
+        sh = {}
+        for prot in ("count", "budget"):
+            vs = []
+            for cid in [c for c in results["semantic_wins"] if c.startswith(fam)]:
+                a = "semantic-bp" if fam == "S5" else "semantic-cl"
+                b = "fixed-" + cid.split("-")[1]
+                for i, d in enumerate(DATASETS):
+                    sign = 1 if lengths[d][a] <= lengths[d][b] else -1
+                    vs.append(sign * vc[(cid, prot)][i])
+            sh[prot] = shares(vs)["A"]
+        est = sh["budget"] - sh["count"]
+        r = results[h]
+        checks.append((f"Study 1b {h} point estimate and verdict rule", close(r["estimate"], est) and r["verdict"] == rule(est, *r["ci95"], thr),
+                       f"independent {100 * est:.1f} pp ({100 * sh['count']:.1f}% -> {100 * sh['budget']:.1f}%); stored {100 * r['estimate']:.1f} {r['verdict']}"))
+    for h, side, thr in (("H5", -1, 0.20), ("H5b", 1, 0.20)):
+        vs = {p: [percentile_verdicts(diffs(run, d, "fixed-128", "fixed-512", p, 512, ["dense"]))[0] for d in DATASETS]
+              for p in ("count", "budget")}
+        key = "B" if side == -1 else "A"
+        est = shares(vs["count"])[key] - shares(vs["budget"])[key]
+        est = est if h == "H5" else -est
+        r = results[h]
+        checks.append((f"Study 1b {h} point estimate and verdict rule", close(r["estimate"], est) and r["verdict"] == rule(est, *r["ci95"], thr),
+                       f"independent {100 * est:.1f} pp; stored {100 * r['estimate']:.1f} [{100 * r['ci95'][0]:.1f}, "
+                       f"{100 * r['ci95'][1]:.1f}] {r['verdict']}"))
+
+
+S5 = [("semantic-bp", f"fixed-{w}") for w in (128, 256, 512)]
+S6 = [("semantic-cl", f"fixed-{w}") for w in (128, 256, 512)]
+
+
+def oriented(run, pairs, protocol, lengths, datasets, retrievers=None, admissible=True):
+    out = {}
+    for a, b in pairs:
+        for d in datasets:
+            x = diffs(run, d, a, b, protocol, 512, retrievers, admissible)
+            x = x if lengths[d][a] <= lengths[d][b] else -x
+            out[d] = np.hstack([out[d], x]) if d in out else x
+    return out
+
+
+def shorter(run, pairs, lengths, datasets=DATASETS, retrievers=None, admissible=True, clusters=None, bh_family=False):
+    """share(shorter arm supported | budget) - share(... | count), with its joint-bootstrap interval."""
+    cl = (lambda d: clusters[d]) if clusters else (lambda d: None)
+    dc = oriented(run, pairs, "count", lengths, datasets, retrievers)
+    db = oriented(run, pairs, "budget", lengths, datasets, retrievers, admissible)
+
+    def verd(x, d):
+        v, lo, hi, mean, p = percentile_verdicts(x, clusters=cl(d))
+        return np.where(bh(p), np.sign(mean), 0) if bh_family else v
+    vc = [verd(dc[d], d) for d in datasets]
+    vb = [verd(db[d], d) for d in datasets]
+    sc, sb = float((np.concatenate(vc) == 1).mean()), float((np.concatenate(vb) == 1).mean())
+    if bh_family:
+        return sb - sc, None, None, sc, sb
+    split = {d: dc[d].shape[1] for d in datasets}
+
+    def stat(v):
+        return float((np.concatenate([v[d][split[d]:] for d in datasets]) == 1).mean()
+                     - (np.concatenate([v[d][: split[d]] for d in datasets]) == 1).mean())
+    lo, hi = joint_share_ci({d: np.hstack([dc[d], db[d]]) for d in datasets}, stat,
+                            clusters={d: clusters[d] for d in datasets} if clusters else None)
+    return sb - sc, lo, hi, sc, sb
+
+
+H5_RECORDED = {"estimate": 0.19444444444444445, "ci95": [0.16666666666666669, 0.41684027777777766], "verdict": "inconclusive"}
+CUAD_SUBSET = {"count": {"n_universes": 12, "support_A": 0.0, "support_B": 0.0, "inconclusive": 1.0,
+                         "mean_delta": -0.005840372294187546},
+               "budget": {"n_universes": 9, "support_A": 1.0, "support_B": 0.0, "inconclusive": 0.0,
+                          "mean_delta": 0.027103044092655182}}
+
+
+def study1b_intervals(run_dir: Path, results: dict, checks: list) -> None:
+    """H4, H4b, H5, H5b intervals and every H4 sensitivity analysis, recomputed independently."""
+    run = load_run(run_dir)
+    lengths = {d: {s["chunking"]: s["chunk_words_mean"] for s in run[d]["manifest"]["chunk_stats"]} for d in DATASETS}
+    clusters = {d: run[d]["doc"] for d in DATASETS}
+    for h, pairs, thr, retr in (("H4", S5, 0.20, None), ("H4b", S6, 0.10, None),
+                                ("H5b", [("fixed-128", "fixed-512")], 0.20, ["dense"])):
+        est, lo, hi, sc, sb = shorter(run, pairs, lengths, retrievers=retr)
+        r = results[h]
+        ok = all(close(x, y) for x, y in ((r["estimate"], est), (r["ci95"][0], lo), (r["ci95"][1], hi),
+                                          (r["count_share"], sc), (r["budget_share"], sb)))
+        ok = ok and r["verdict"] == rule(est, lo, hi, thr)
+        checks.append((f"Study 1b {h}: estimate, shares, joint-bootstrap CI and verdict", ok,
+                       f"independent {100 * est:.1f} pp [{100 * lo:.1f}, {100 * hi:.1f}] -> {rule(est, lo, hi, thr)}"))
+    est, lo, hi = share_contrast(run, "fixed-128", "fixed-512", 512, -1, retrievers=["dense"])
+    r = results["H5"]
+    ok = close(r["estimate"], est) and close(r["ci95"][0], lo) and close(r["ci95"][1], hi) and r["verdict"] == rule(est, lo, hi, 0.20)
+    rec = H5_RECORDED
+    ok_rec = r["estimate"] == rec["estimate"] and r["ci95"] == rec["ci95"] and r["verdict"] == rec["verdict"]
+    checks.append(("Study 1b H5: estimate, joint-bootstrap CI and verdict (and equal to the recorded values)", ok and ok_rec,
+                   f"independent {est!r} [{lo!r}, {hi!r}] -> {rule(est, lo, hi, 0.20)}"))
+    bad = 0
+    for prot, want in CUAD_SUBSET.items():
+        stored = r[prot]["by_dataset"]["cuad"]
+        v, _, _, mean, _ = percentile_verdicts(diffs(run, "cuad", "fixed-128", "fixed-512", prot, 512, ["dense"]))
+        ind = {"n_universes": int(v.size), "support_A": float((v == 1).mean()), "support_B": float((v == -1).mean()),
+               "inconclusive": float((v == 0).mean()), "mean_delta": float(mean.mean())}
+        for k, x in want.items():
+            bad += not (close(stored[k], x, 1e-15) and close(ind[k], x, 1e-15))
+    checks.append(("Study 1b CUAD dense P1 subset (10 fields): stored and independent values equal the recorded ones",
+                   bad == 0, f"{bad} mismatches"))
+    sens = results["H4_sensitivity"]
+    bad, lines = 0, []
+    for key, kw in (("a_bh_fdr", {"bh_family": True}),
+                    ("b_without_squad2", {"datasets": [d for d in DATASETS if d != "squad2"]}),
+                    ("d_cluster_bootstrap", {"clusters": clusters}), ("e_all_budgets", {"admissible": False}),
+                    ("f_bm25_only", {"retrievers": ["bm25"]}), ("f_dense_only", {"retrievers": ["dense"]})):
+        est, lo, hi, _, _ = shorter(run, S5, lengths, **kw)
+        s = sens[key]
+        ok = close(s["estimate"], est) and (lo is None or (close(s["ci95"][0], lo) and close(s["ci95"][1], hi)))
+        bad += not ok
+        lines.append(f"{key} {100 * est:.1f}" + ("" if lo is None else f" [{100 * lo:.1f}, {100 * hi:.1f}]"))
+    checks.append(("Study 1b H4 sensitivity analyses (a), (b), (d), (e), (f): estimates and CIs", bad == 0, "; ".join(lines)))
+
+
+# ------------------------------------------------------------------------------------------------ Tier 2
+def generation_rows(ds_dir: Path) -> list[dict]:
+    """Rows of the generation log, or of its metrics-only form (same rows without answer and response text)."""
+    log = ds_dir / "generations.jsonl"
+    path = log if log.exists() else ds_dir / "generations.metrics.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def tier2(results: dict, checks: list, post: dict) -> None:
+    claims = {"P1": ("fixed-128", "fixed-512"), "S3-256": ("paragraph-256", "fixed-256")}
+    run = E2 / "runs" / "qwen3-4b-kaggle-gpu"
+    per = {}
+    for d in DATASETS:
+        cells = {}
+        for r in generation_rows(run / d):
+            if r["status"] == "ok":
+                cells[(r["qid"], r["chunking"], r["op"])] = r
+        qids = sorted({k[0] for k in cells})
+        per[d] = (qids, cells)
+    bad = 0
+    for claim, (a, b) in claims.items():
+        for field in ("f1", "em", "coverage"):
+            did = {}
+            for d, (qids, cells) in per.items():
+                val = lambda q, c, o: cells[(q, c, o)][field] if field != "coverage" else cells[(q, c, o)]["retrieval"][field]  # noqa: E731
+                did[d] = np.array([(val(q, a, "budget1024") - val(q, b, "budget1024")) - (val(q, a, "count5") - val(q, b, "count5"))
+                                   for q in qids])
+            point = float(np.mean([did[d].mean() for d in DATASETS]))
+            rng = np.random.default_rng(7)
+            boot = np.zeros(2000)
+            for d in sorted(did):
+                x = did[d]
+                boot += (rng.multinomial(len(x), np.full(len(x), 1 / len(x)), size=2000) @ x) / len(x)
+            lo, hi = np.quantile(boot / 4, [0.025, 0.975])
+            st = results["pooled"][claim][field]
+            ok = close(st["did"], point) and close(st["lo"], lo) and close(st["hi"], hi)
+            ok = ok and st["verdict"] == ("carries over" if lo > 0 else "opposite" if hi < 0 else "inconclusive")
+            bad += not ok
+            se = np.sqrt(sum(np.var(did[d], ddof=1) / len(did[d]) for d in DATASETS)) / 4
+            post.setdefault("tier2_mde", {})[f"{claim}/{field}"] = {"stored_pooled_sd": st["mde"],
+                                                                    "equal_weight_estimand": float((Z975 + Z80) * se)}
+    checks.append(("Tier 2 pooled DiD, stratified bootstrap CI and reading rule (2 claims x 3 measures)", bad == 0,
+                   f"{bad} mismatches; complete cases per dataset: " + ", ".join(f"{d} {len(per[d][0])}" for d in DATASETS)))
+
+
+def normal_verdict_estimates(post: dict) -> None:
+    """POST-HOC: each hypothesis statistic with verdicts from normal-approximation intervals on the full sample, i.e.
+    the statistic whose sampling distribution the joint bootstrap describes (the plan's point estimate uses
+    percentile-bootstrap verdicts)."""
+    def nv(x):
+        n = x.shape[0]
+        m, sd = x.mean(axis=0, dtype=np.float64), x.std(axis=0, ddof=1, dtype=np.float64)
+        half = Z975 * sd / np.sqrt(n)
+        return np.where(m - half > 0, 1, np.where(m + half < 0, -1, 0))
+
+    out = {}
+    e1, e3 = load_run(E1 / "runs/confirmatory-20261018"), load_run(E3 / "runs/confirmatory-kaggle-gpu")
+    for h, (a, b, wmax, side, sign) in {"H1": ("fixed-128", "fixed-512", 512, -1, 1),
+                                         "H1b": ("paragraph-256", "fixed-256", 256, 1, -1)}.items():
+        c = np.concatenate([nv(diffs(e1, d, a, b, "count", wmax)) for d in DATASETS])
+        bu = np.concatenate([nv(diffs(e1, d, a, b, "budget", wmax)) for d in DATASETS])
+        out[h] = sign * float((c == side).mean() - (bu == side).mean())
+    c = np.concatenate([nv(diffs(e3, d, "fixed-128", "fixed-512", "count", 512, ["dense"])) for d in DATASETS])
+    bu = np.concatenate([nv(diffs(e3, d, "fixed-128", "fixed-512", "budget", 512, ["dense"])) for d in DATASETS])
+    out["H5"] = float((c == -1).mean() - (bu == -1).mean())
+    lengths = {d: {s["chunking"]: s["chunk_words_mean"] for s in e3[d]["manifest"]["chunk_stats"]} for d in DATASETS}
+    for h, pairs, retr in (("H4", S5, None), ("H4b", S6, None), ("H5b", [("fixed-128", "fixed-512")], ["dense"])):
+        oc, ob = oriented(e3, pairs, "count", lengths, DATASETS, retr), oriented(e3, pairs, "budget", lengths, DATASETS, retr)
+        out[h] = float((np.concatenate([nv(ob[d]) for d in DATASETS]) == 1).mean()
+                       - (np.concatenate([nv(oc[d]) for d in DATASETS]) == 1).mean())
+    post["normal_verdict_point_estimates"] = {
+        "label": "POST-HOC: hypothesis statistics with normal-approximation verdicts on the full sample (the statistic "
+                 "the joint-bootstrap replicates use); the planned estimates use percentile-bootstrap verdicts",
+        "estimates": out}
+
+
+def tier2_per_dataset(results: dict, checks: list) -> None:
+    """Every per-dataset contrast (mean, CI, n, verdict) and cell mean of the Tier 2 analysis, recomputed."""
+    claims = {"P1": ("fixed-128", "fixed-512"), "S3-256": ("paragraph-256", "fixed-256")}
+    run = E2 / "runs" / "qwen3-4b-kaggle-gpu"
+    bad = n = 0
+    for d in DATASETS:
+        last = {}
+        for r in generation_rows(run / d):
+            if r["status"] == "ok":
+                last[r["job_id"]] = r
+        cells = {(r["qid"], r["chunking"], r["op"]): r for r in last.values()}
+        need = [(c, o) for pair in claims.values() for c in pair for o in ("count5", "budget1024")]
+        qids = sorted(q for q in {k[0] for k in cells} if all((q, c, o) in cells for c, o in need))
+        st = results["datasets"][d]
+        n += 1
+        bad += st["n_complete_queries"] != len(qids)
+        val = lambda q, c, o, f: cells[(q, c, o)][f] if f in ("f1", "em") else cells[(q, c, o)]["retrieval"][f]  # noqa: E731
+        for c, o in need:
+            for f in ("f1", "em", "hit_strict", "hit_lenient", "coverage"):
+                n += 1
+                bad += not close(st["means"][f"{c}|{o}"][f], np.mean([val(q, c, o, f) for q in qids]))
+        for claim, (a, b) in claims.items():
+            for f in ("f1", "em", "coverage"):
+                con = {o: np.array([val(q, a, o, f) - val(q, b, o, f) for q in qids]) for o in ("count5", "budget1024")}
+                con["did"] = con["budget1024"] - con["count5"]
+                for k, x in con.items():
+                    w = np.random.default_rng(7).multinomial(len(x), np.full(len(x), 1 / len(x)), size=2000).astype(np.float32)
+                    boot = (w @ x.astype(np.float32)) / w.sum(axis=1)
+                    lo, hi = np.quantile(boot, [0.025, 0.975])
+                    s = st["claims"][claim][f][k]
+                    n += 1
+                    ok = close(s["mean"], x.astype(np.float32).mean(), 1e-7) and close(s["lo"], lo, 1e-7) \
+                        and close(s["hi"], hi, 1e-7) and s["n"] == len(x)
+                    if k != "did":
+                        want = "supports A" if lo > 0 else "supports B" if hi < 0 else "inconclusive"
+                        ok = ok and s["verdict"] == want
+                    bad += not ok
+    checks.append(("Tier 2 per-dataset contrasts, cell means and complete-case counts", bad == 0,
+                   f"{n} quantities compared, {bad} mismatches"))
+
+
+def h1_by_metric(run_dir: Path, post: dict, consistent: bool = False) -> None:
+    """POST-HOC: the P1 protocol contrast (fixed-128 vs fixed-512) separately for each span metric, pooled and per
+    dataset, with the planned verdict rule. Universes are ordered (retriever, operating point, metric), so metric i is
+    every third column; the planned H1 is the mean of the three per-metric declines."""
+    run = load_run(run_dir)
+    metrics = ("hit_strict", "hit_lenient", "coverage")
+    verdict = (lambda x: wald_verdicts(x)[0]) if consistent else (lambda x: percentile_verdicts(x)[0])
+    vc = {d: verdict(diffs(run, d, "fixed-128", "fixed-512", "count", 512)) for d in DATASETS}
+    vb = {d: verdict(diffs(run, d, "fixed-128", "fixed-512", "budget", 512)) for d in DATASETS}
+
+    def summary(c, b):
+        return {"count_512": float((c == -1).mean()), "count_128": float((c == 1).mean()),
+                "budget_512": float((b == -1).mean()), "budget_128": float((b == 1).mean()),
+                "decline_512": float((c == -1).mean() - (b == -1).mean())}
+    out = {"by_metric": {}, "by_dataset_metric": {}}
+    for i, m in enumerate(metrics):
+        out["by_metric"][m] = summary(np.concatenate([vc[d][i::3] for d in DATASETS]),
+                                      np.concatenate([vb[d][i::3] for d in DATASETS]))
+        for d in DATASETS:
+            out["by_dataset_metric"][f"{d}/{m}"] = summary(vc[d][i::3], vb[d][i::3])
+    out["mean_of_metric_declines"] = float(np.mean([v["decline_512"] for v in out["by_metric"].values()]))
+    post["H1_by_metric_consistent" if consistent else "H1_by_metric"] = out
+
+
+# ------------------------------------------------------------------------------------------------ consistent procedure
+def wald_verdicts(x, inv=None, counts=None):
+    """Consistent verdict rule, written independently of ragmv.stats: 95% Wald interval of the mean difference with
+    the standard error at the resampling unit. Queries: weights `counts` per query, z value. Documents (`inv` = document
+    index of each query, 0..G-1): `counts` per document, CR1 standard error from per-document residual sums, t(G-1)."""
+    from scipy import stats as st
+    x = np.asarray(x, dtype=np.float64)
+    if inv is None:
+        w = np.ones(len(x)) if counts is None else counts
+        n = w.sum()
+        m = (w[:, None] * x).sum(axis=0) / n
+        se = np.sqrt((w[:, None] * (x - m) ** 2).sum(axis=0) / (n - 1) / n)
+        crit = st.norm.ppf(0.975)
+    else:
+        g = int(inv.max()) + 1
+        k = np.ones(g) if counts is None else counts
+        wq = k[inv]
+        n = wq.sum()
+        m = (wq[:, None] * x).sum(axis=0) / n
+        resid = np.zeros((g, x.shape[1]))
+        np.add.at(resid, inv, x - m)
+        se = np.sqrt(g / (g - 1) * (k[:, None] * resid ** 2).sum(axis=0)) / n
+        crit = st.t.ppf(0.975, g - 1)
+    return np.where(m - crit * se > 0, 1, np.where(m + crit * se < 0, -1, 0)), m, se
+
+
+def consistent_joint(blocks, side_stat, invs, reps=1000, seed=11):
+    """Joint bootstrap with the same draws as the plan's (seed 11, dataset order) and Wald verdicts at the unit that is
+    resampled (`invs[d]` None = queries)."""
+    rng = np.random.default_rng(seed)
+    out = np.empty(reps)
+    for r in range(reps):
+        v = {}
+        for d, x in blocks.items():
+            if invs[d] is None:
+                n = x.shape[0]
+                v[d] = wald_verdicts(x, None, rng.multinomial(n, np.full(n, 1.0 / n)).astype(np.float64))[0]
+            else:
+                g = int(invs[d].max()) + 1
+                v[d] = wald_verdicts(x, invs[d], rng.multinomial(g, np.full(g, 1.0 / g)).astype(np.float64))[0]
+        out[r] = side_stat(v)
+    lo, hi = np.quantile(out, [0.025, 0.975])
+    return float(lo), float(hi)
+
+
+def doc_inv(run, unit):
+    return {d: (np.unique(run[d]["doc"], return_inverse=True)[1] if unit == "document" else None) for d in DATASETS}
+
+
+def consistent_contrast(dc, db, side, invs, sign=1.0):
+    """sign * (share(side | count) - share(side | budget)) with its interval, under the consistent rule."""
+    ds = list(dc)
+    vc = np.concatenate([wald_verdicts(dc[d], invs[d])[0] for d in ds])
+    vb = np.concatenate([wald_verdicts(db[d], invs[d])[0] for d in ds])
+    est = float((vc == side).mean() - (vb == side).mean())
+    split = {d: dc[d].shape[1] for d in ds}
+
+    def stat(v):
+        return float((np.concatenate([v[d][: split[d]] for d in ds]) == side).mean()
+                     - (np.concatenate([v[d][split[d]:] for d in ds]) == side).mean())
+    lo, hi = consistent_joint({d: np.hstack([dc[d], db[d]]) for d in ds}, stat, {d: invs[d] for d in ds})
+    return (est, lo, hi) if sign > 0 else (-est, -hi, -lo)
+
+
+def consistent_bh(post: dict, checks: list) -> None:
+    """Sensitivity (a) under the consistent procedure (Wald p-values, query unit), for the implemented family (claim x
+    protocol x dataset) and, post-hoc, for the family pooled over datasets."""
+    from scipy import stats as st
+    e1 = load_run(E1 / "runs/confirmatory-20261018")
+    stored = json.loads((E1 / "analysis/confirmatory-20261018-consistent-query/results.json").read_text())
+    out = {}
+    for family in ("per_dataset", "pooled_over_datasets"):
+        sh = {}
+        for prot in ("count", "budget"):
+            ps, ms = [], []
+            for d in DATASETS:
+                _, m, se = wald_verdicts(diffs(e1, d, "fixed-128", "fixed-512", prot, 512))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    p = np.where(se > 0, 2 * st.norm.sf(np.abs(m) / se), np.where(m == 0, 1.0, 0.0))
+                ps.append(p)
+                ms.append(m)
+            if family == "per_dataset":
+                v = np.concatenate([np.where(bh(p), np.sign(m), 0) for p, m in zip(ps, ms)])
+            else:
+                v = np.where(bh(np.concatenate(ps)), np.sign(np.concatenate(ms)), 0)
+            sh[prot] = float((v == -1).mean())
+        out[family] = sh["count"] - sh["budget"]
+    post["BH_family_P1_consistent"] = out
+    st_bh = stored["H1_sensitivity"]["a_bh_fdr"]["estimate"]
+    checks.append(("Consistent procedure: sensitivity (a) Benjamini-Hochberg (family claim x protocol x dataset)",
+                   close(st_bh, out["per_dataset"]), f"independent {100 * out['per_dataset']:.1f} pp, stored {100 * st_bh:.1f} pp"))
+
+
+def consistent_checks(checks: list) -> None:
+    """Every hypothesis of Studies 1 and 1b under the consistent procedure, at the query and the document unit,
+    compared with the stored corrected analyses (analysis/*-consistent-{query,document})."""
+    e1, e3 = load_run(E1 / "runs/confirmatory-20261018"), load_run(E3 / "runs/confirmatory-kaggle-gpu")
+    lengths = {d: {s["chunking"]: s["chunk_words_mean"] for s in e3[d]["manifest"]["chunk_stats"]} for d in DATASETS}
+    for unit in ("query", "document"):
+        r1 = json.loads((E1 / f"analysis/confirmatory-20261018-consistent-{unit}/results.json").read_text())
+        r3 = json.loads((E3 / f"analysis/confirmatory-kaggle-gpu-consistent-{unit}/results.json").read_text())
+        i1, i3 = doc_inv(e1, unit), doc_inv(e3, unit)
+        got = {
+            "H1": (consistent_contrast({d: diffs(e1, d, "fixed-128", "fixed-512", "count", 512) for d in DATASETS},
+                                       {d: diffs(e1, d, "fixed-128", "fixed-512", "budget", 512) for d in DATASETS},
+                                       -1, i1), 0.20, r1),
+            "H1b": (consistent_contrast({d: diffs(e1, d, "paragraph-256", "fixed-256", "count", 256) for d in DATASETS},
+                                        {d: diffs(e1, d, "paragraph-256", "fixed-256", "budget", 256) for d in DATASETS},
+                                        1, i1, sign=-1), 0.10, r1),
+            "H5": (consistent_contrast({d: diffs(e3, d, "fixed-128", "fixed-512", "count", 512, ["dense"]) for d in DATASETS},
+                                       {d: diffs(e3, d, "fixed-128", "fixed-512", "budget", 512, ["dense"]) for d in DATASETS},
+                                       -1, i3), 0.20, r3)}
+        for h, pairs, retr, thr in (("H4", S5, None, 0.20), ("H4b", S6, None, 0.10),
+                                    ("H5b", [("fixed-128", "fixed-512")], ["dense"], 0.20)):
+            oc = oriented(e3, pairs, "count", lengths, DATASETS, retr)
+            ob = oriented(e3, pairs, "budget", lengths, DATASETS, retr)
+            got[h] = (consistent_contrast(oc, ob, 1, i3, sign=-1), thr, r3)
+        for h, ((est, lo, hi), thr, res) in got.items():
+            r = res[h]
+            ok = close(r["estimate"], est) and close(r["ci95"][0], lo) and close(r["ci95"][1], hi) \
+                and r["verdict"] == rule(est, lo, hi, thr)
+            checks.append((f"Consistent procedure ({unit} unit): {h} estimate, interval and verdict", ok,
+                           f"independent {100 * est:.1f} [{100 * lo:.1f}, {100 * hi:.1f}] {rule(est, lo, hi, thr)}; "
+                           f"stored {100 * r['estimate']:.1f} [{100 * r['ci95'][0]:.1f}, {100 * r['ci95'][1]:.1f}] {r['verdict']}"))
+
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-json", required=True)
+    ap.add_argument("--out-md", required=True)
+    args = ap.parse_args(argv)
+    checks, post = [], {}
+    study1(E1 / "runs/confirmatory-20261018", json.loads((E1 / "analysis/confirmatory-20261018/results.json").read_text()), checks, post)
+    study1b(E3 / "runs/confirmatory-kaggle-gpu", json.loads((E3 / "analysis/confirmatory-kaggle-gpu/results.json").read_text()), checks)
+    study1_extras(E1 / "runs/confirmatory-20261018", json.loads((E1 / "analysis/confirmatory-20261018/results.json").read_text()), checks)
+    study1b_intervals(E3 / "runs/confirmatory-kaggle-gpu", json.loads((E3 / "analysis/confirmatory-kaggle-gpu/results.json").read_text()), checks)
+    study1b_seed_sensitivity(E3 / "runs/confirmatory-kaggle-gpu", post)
+    tier2(json.loads((E2 / "analysis/qwen3-4b-kaggle-gpu/results.json").read_text()), checks, post)
+    tier2_per_dataset(json.loads((E2 / "analysis/qwen3-4b-kaggle-gpu/results.json").read_text()), checks)
+    normal_verdict_estimates(post)
+    h1_by_metric(E1 / "runs/confirmatory-20261018", post)
+    h1_by_metric(E1 / "runs/confirmatory-20261018", post, consistent=True)
+    consistent_checks(checks)
+    consistent_bh(post, checks)
+    Path(args.out_json).write_text(json.dumps({"checks": checks, "posthoc": post}, indent=2))
+    lines = ["| Status | Check | Detail |", "|---|---|---|"]
+    lines += [f"| {'PASS' if ok else 'FAIL'} | {name} | {detail} |" for name, ok, detail in checks]
+    Path(args.out_md).write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(json.dumps(post, indent=1))
+    return 0 if all(ok for _, ok, _ in checks) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

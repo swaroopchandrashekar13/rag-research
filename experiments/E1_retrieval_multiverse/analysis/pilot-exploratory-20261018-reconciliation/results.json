@@ -1,0 +1,75 @@
+{
+  "label": "Reconciliation of the stored pilot analysis (planned procedure)",
+  "sensitivity": {
+    "b_without_squad2": {
+      "estimate": 0.6238425925925926,
+      "stored_ci95": [
+        0.5096643518518518,
+        0.7628472222222221
+      ],
+      "earlier_settings_ci95": [
+        0.5096643518518518,
+        0.7628472222222221
+      ],
+      "reproduces_stored": true,
+      "current_ci95": [
+        0.517896412037037,
+        0.7627314814814814
+      ],
+      "max_abs_difference_current_vs_stored": 0.008232060185185186
+    },
+    "c_default_retriever": {
+      "estimate": 0.6666666666666666,
+      "stored_ci95": [
+        0.5413194444444445,
+        0.7916666666666666
+      ],
+      "earlier_settings_ci95": [
+        0.5413194444444445,
+        0.7916666666666666
+      ],
+      "reproduces_stored": true,
+      "current_ci95": [
+        0.5416666666666666,
+        0.7920138888888886
+      ],
+      "max_abs_difference_current_vs_stored": 0.0003472222222221655
+    },
+    "d_cluster_bootstrap": {
+      "estimate": 0.7109375,
+      "stored_ci95": [
+        0.6226236979166666,
+        0.8103624131944445
+      ],
+      "earlier_settings_ci95": [
+        0.6226236979166666,
+        0.8103624131944445
+      ],
+      "reproduces_stored": true,
+      "current_ci95": [
+        0.6041124131944444,
+        0.81513671875
+      ],
+      "max_abs_difference_current_vs_stored": 0.018511284722222188
+    },
+    "e_all_budgets": {
+      "estimate": 0.7270833333333333,
+      "stored_ci95": [
+        0.6338476562500001,
+        0.8120703125000001
+      ],
+      "earlier_settings_ci95": [
+        0.6338476562500001,
+        0.8120703125000001
+      ],
+      "reproduces_stored": true,
+      "current_ci95": [
+        0.6320182291666667,
+        0.8166731770833333
+      ],
+      "max_abs_difference_current_vs_stored": 0.004602864583333255
+    }
+  },
+  "earlier_settings": "200 joint-bootstrap replicates for sensitivity intervals; sensitivity (d) interval from query resampling",
+  "current_settings": "1,000 joint-bootstrap replicates; sensitivity (d) interval from document resampling"
+}

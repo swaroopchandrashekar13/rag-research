@@ -1,0 +1,39 @@
+{
+ "rows": [
+  {
+   "label": "S5-128: semantic-bp vs fixed-128",
+   "count": 0.4375,
+   "budget": -0.6666666666666666
+  },
+  {
+   "label": "S5-256: semantic-bp vs fixed-256",
+   "count": 0.35416666666666663,
+   "budget": -0.5
+  },
+  {
+   "label": "S5-512: semantic-bp vs fixed-512",
+   "count": -0.17708333333333337,
+   "budget": 0.6805555555555556
+  },
+  {
+   "label": "S6-128: semantic-cl vs fixed-128",
+   "count": 0.5208333333333333,
+   "budget": -0.9722222222222222
+  },
+  {
+   "label": "S6-256: semantic-cl vs fixed-256",
+   "count": 0.46875,
+   "budget": -0.8611111111111112
+  },
+  {
+   "label": "S6-512: semantic-cl vs fixed-512",
+   "count": 0.010416666666666657,
+   "budget": 0.2222222222222222
+  },
+  {
+   "label": "P1-dense: fixed-128 vs fixed-512",
+   "count": 0.0625,
+   "budget": 0.861111111111111
+  }
+ ]
+}

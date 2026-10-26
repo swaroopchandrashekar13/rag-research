@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this code or these results, please cite them as below."
+type: software
+title: "Chunking verdicts under count- and budget-matched retrieval: code, analysis plans and results"
+abstract: >-
+  Code, analysis plans, deviation logs, run manifests, per-query results and analyses for a multiverse analysis of how
+  the retrieval-selection protocol (a fixed number of chunks or a fixed word budget) changes chunking verdicts in
+  retrieval-augmented generation, with an extension to semantic chunking and dense retrieval and an exploratory
+  answer-quality check. The source datasets are not included; a fetch script downloads them and checks their digests.
+authors:
+  - family-names: "Chand J C"
+    given-names: "Swaroop"
+license:
+  - MIT
+  - CC-BY-4.0
+keywords:
+  - retrieval-augmented generation
+  - chunking
+  - evaluation methodology
+  - multiverse analysis
+  - information retrieval

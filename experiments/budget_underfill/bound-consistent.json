@@ -1,0 +1,179 @@
+{
+  "label": "POST-HOC upper bound for underfilled budget selections",
+  "cells": [
+    {
+      "study": "Study 1b",
+      "run": "confirmatory-kaggle-gpu",
+      "dataset": "qasper",
+      "chunking": "fixed-128",
+      "retriever": "dense",
+      "budget": 2048,
+      "query_index": 1424,
+      "qid": "qasper:f52c9744a371104eb2677c181a7004f7a77d9dd3",
+      "words": 1880,
+      "deficit": 168,
+      "recorded_depth": 36,
+      "n_chunks": 19124,
+      "cause": "ranking-depth cutoff (recorded depth < corpus size)",
+      "attribution": "manifest depth; ranking not stored",
+      "stored_scores": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "study": "Study 1b",
+      "run": "confirmatory-kaggle-gpu",
+      "dataset": "qasper",
+      "chunking": "fixed-256",
+      "retriever": "dense",
+      "budget": 2048,
+      "query_index": 724,
+      "qid": "qasper:c97306c1be5d59cf27b1054adfa8f1da47d292ce",
+      "words": 1789,
+      "deficit": 259,
+      "recorded_depth": 28,
+      "n_chunks": 9721,
+      "cause": "ranking-depth cutoff (recorded depth < corpus size)",
+      "attribution": "manifest depth; ranking not stored",
+      "stored_scores": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "runs": {
+    "confirmatory-kaggle-gpu": {
+      "changed_fields": [
+        {
+          "field": "H4.ci95[0]",
+          "stored": 0.5081018518518519,
+          "upper_bound": 0.5092303240740741
+        },
+        {
+          "field": "H4.replicate_mean",
+          "stored": 0.5690960648148148,
+          "upper_bound": 0.5693229166666668
+        },
+        {
+          "field": "H4.replicate_mean_minus_estimate",
+          "stored": 0.013540509259259204,
+          "upper_bound": 0.01376736111111121
+        },
+        {
+          "field": "H4_sensitivity.b_without_squad2.replicate_mean",
+          "stored": 0.5064444444444444,
+          "upper_bound": 0.5068765432098765
+        },
+        {
+          "field": "H4_sensitivity.b_without_squad2.replicate_mean_minus_estimate",
+          "stored": 0.024962962962962854,
+          "upper_bound": 0.025395061728395008
+        },
+        {
+          "field": "H4_sensitivity.d_cluster_bootstrap.replicate_mean",
+          "stored": 0.581486111111111,
+          "upper_bound": 0.5817592592592593
+        },
+        {
+          "field": "H4_sensitivity.d_cluster_bootstrap.replicate_mean_minus_estimate",
+          "stored": -0.008791666666666642,
+          "upper_bound": -0.00851851851851837
+        },
+        {
+          "field": "H4_sensitivity.e_all_budgets.replicate_mean",
+          "stored": 0.5540340277777779,
+          "upper_bound": 0.5541701388888889
+        },
+        {
+          "field": "H4_sensitivity.e_all_budgets.replicate_mean_minus_estimate",
+          "stored": 0.01792291666666679,
+          "upper_bound": 0.018059027777777792
+        },
+        {
+          "field": "H4_sensitivity.f_dense_only.ci95[0]",
+          "stored": 0.3912037037037037,
+          "upper_bound": 0.39346064814814813
+        },
+        {
+          "field": "H4_sensitivity.f_dense_only.replicate_mean",
+          "stored": 0.48886805555555557,
+          "upper_bound": 0.48932175925925925
+        },
+        {
+          "field": "H4_sensitivity.f_dense_only.replicate_mean_minus_estimate",
+          "stored": -0.01113194444444443,
+          "upper_bound": -0.010678240740740752
+        },
+        {
+          "field": "H4b.replicate_mean",
+          "stored": 0.6250162037037037,
+          "upper_bound": 0.6251689814814815
+        },
+        {
+          "field": "H4b.replicate_mean_minus_estimate",
+          "stored": -0.02776157407407409,
+          "upper_bound": -0.027608796296296312
+        },
+        {
+          "field": "H5.budget.by_dataset.qasper.mean_delta",
+          "stored": 0.03131647373982452,
+          "upper_bound": 0.03150782467744411
+        },
+        {
+          "field": "H5.replicate_mean",
+          "stored": 0.27013888888888893,
+          "upper_bound": 0.2708888888888889
+        },
+        {
+          "field": "H5.replicate_mean_minus_estimate",
+          "stored": 0.054861111111111166,
+          "upper_bound": 0.05561111111111114
+        },
+        {
+          "field": "semantic_wins.S5-128.budget.by_dataset.qasper.mean_delta",
+          "stored": -0.008155394883952071,
+          "upper_bound": -0.008251070352761868
+        },
+        {
+          "field": "semantic_wins.S5-256.budget.by_dataset.qasper.mean_delta",
+          "stored": -0.0005356338136976874,
+          "upper_bound": -0.0006313092825074849
+        },
+        {
+          "field": "semantic_wins.S6-128.budget.by_dataset.qasper.mean_delta",
+          "stored": -0.035033881504600455,
+          "upper_bound": -0.035129556973410254
+        },
+        {
+          "field": "semantic_wins.S6-256.budget.by_dataset.qasper.mean_delta",
+          "stored": -0.027414120434346073,
+          "upper_bound": -0.027509795903155873
+        }
+      ],
+      "identical_fields": 522,
+      "hypothesis_verdicts": {
+        "H4": [
+          "supported",
+          "supported"
+        ],
+        "H4b": [
+          "supported",
+          "supported"
+        ],
+        "H5": [
+          "supported",
+          "supported"
+        ],
+        "H5b": [
+          "supported",
+          "supported"
+        ]
+      },
+      "verdict_changes": []
+    }
+  },
+  "inference": "consistent"
+}
